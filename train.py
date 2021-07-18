@@ -2,6 +2,7 @@ from collections import deque
 from pathlib import Path
 import pickle
 
+from fire import Fire
 import jax
 from jax.experimental import optimizers
 import jax.numpy as jnp
@@ -87,9 +88,12 @@ def main(data_file,
 
         last_epoch_loss = epoch_loss.item() / (step - epoch_start)
 
-        if epoch % save_period == 0:
+        if save_period is not None and epoch % save_period == 0:
             with (out_path / f'weights_{epoch:02d}.pkl').open('wb') as f:
                 pickle.dump(get_params(opt_state), f)
 
     with (out_path / 'weights.pkl').open('wb') as f:
         pickle.dump(get_params(opt_state), f)
+
+if __name__ == '__main__':
+    Fire(main)

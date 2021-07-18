@@ -199,7 +199,7 @@ def load_model(path='models/117M',
     if not train:
         model = hk.without_apply_rng(model)
 
-    with (model_path / 'weights.pkl').open() as f:
+    with (model_path / 'weights.pkl').open('rb') as f:
         params = pickle.load(f)
 
     params = jax.tree_map(jnp.array, params)
