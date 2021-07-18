@@ -1,0 +1,4 @@
+fire
+tqdm
+numpy
+dm-haiku
