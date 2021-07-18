@@ -6,7 +6,7 @@ My minimal-ish port of GPT-2 to JAX/haiku. I'd recommend the HuggingFace FLAX on
 ```
 pip install -r requirements.txt
 ```
-* Download the weights [here]()
+* Download the weights [here](https://drive.google.com/file/d/1ttXO_7OdId9DHFHFT3XSWOthjjHceI-Y/view?usp=sharing)
 
 * Choose a text file, and run the training script:
 ```
