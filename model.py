@@ -1,4 +1,5 @@
 from collections import namedtuple
+from functools import partial
 import json
 from pathlib import Path
 import pickle
@@ -60,7 +61,7 @@ class GPT2Attention(ConfigModule):
         self.conv1 = hk.Conv1D(config.n_embd * 3, 1, name='c_attn', w_init=hk.initializers.RandomNormal(0.02))
         self.conv2 = hk.Conv1D(config.n_embd, 1, name='c_proj', w_init=hk.initializers.RandomNormal(0.02))
 
-    def __call__(self, x, past, perturb=None, train=False):
+    def __call__(self, x, past, perturb=None, prepend_kv=None, train=False):
         past, past_length = past
 
         c = self.conv1(x)
@@ -71,14 +72,19 @@ class GPT2Attention(ConfigModule):
             v +=  perturb[1]
 
         if past is not None:
-            pk, pv = jnp.split(past, 2, axis=0)
-            pk = jnp.squeeze(pk, axis=0)
-            pv = jnp.squeeze(pv, axis=0)
+            pk, pv = map(partial(jnp.squeeze, axis=0), jnp.split(past, 2, axis=0))
 
             k = jax.lax.dynamic_update_slice_in_dim(pk, k, past_length, axis=1)
             v = jax.lax.dynamic_update_slice_in_dim(pv, v, past_length, axis=1)
 
+        if prepend_kv is not None:
+            prepend_k, prepend_v = map(partial(jnp.squeeze, axis=0), jnp.split(prepend_kv, 2, axis=0))
+            past_length += prepend_k.shape[1]
+
+            k, v = (jnp.concatenate((prefix, vecs), axis=1) for prefix, vecs in [(prepend_k, k), (prepend_v, v)])
+
         a = self.multihead_attn(q, k, v, train=train, n_past=past_length)
+        # bug is before here
         a = merge_heads(a)
         a = self.conv2(a)
         if train:
@@ -95,7 +101,6 @@ class GPT2Attention(ConfigModule):
         if train:
             w = hk.dropout(hk.next_rng_key(), self.config.drop_rate, w)
         a = w @ v
-        a = jax.lax.dynamic_slice_in_dim(a, n_past, q.shape[1], axis=1)
         return a
 
 class MLP(ConfigModule):
@@ -119,8 +124,8 @@ class GPT2Block(ConfigModule):
         self.norm1 = hk.LayerNorm(-1, create_scale=True, create_offset=True, name='ln_1')
         self.norm2 = hk.LayerNorm(-1, create_scale=True, create_offset=True, name='ln_2')
 
-    def __call__(self, x, past, perturb=None, train=False):
-        a, present = self.attn(self.norm1(x), perturb=perturb, past=past, train=train)
+    def __call__(self, x, train=False, **kwargs):
+        a, present = self.attn(self.norm1(x), train=train, **kwargs)
         x = x + a
         m = self.mlp(self.norm2(x), train=train)
         x = x + m
@@ -135,7 +140,7 @@ class GPT2Model(ConfigModule):
 
         self.max_len = max_len
 
-    def __call__(self, inputs, past, hidden_perturb=None, train=False, use_past=False):
+    def __call__(self, inputs, past, prepend_kv=None, hidden_perturb=None, train=False, use_past=False):
         wte =  hk.get_parameter('wte', [self.config.n_vocab, self.config.n_embd], init=hk.initializers.RandomNormal(0.02))
         wpe =  hk.get_parameter('wpe', [self.config.n_ctx, self.config.n_embd], init=hk.initializers.RandomNormal(0.01))
 
@@ -161,9 +166,12 @@ class GPT2Model(ConfigModule):
         if hidden_perturb is None:
             hidden_perturb = [None] * self.config.n_layer
 
+        if prepend_kv is None:
+            prepend_kv = [None] * self.config.n_layer
+
         presents = []
-        for layer, layer_past, layer_pert in zip(self.layers, past, hidden_perturb):
-            h, present = layer(h, past=(layer_past, past_length), perturb=layer_pert, train=train)
+        for layer, layer_past, layer_pert, layer_prepend in zip(self.layers, past, hidden_perturb, prepend_kv):
+            h, present = layer(h, past=(layer_past, past_length), perturb=layer_pert, prepend_kv=layer_prepend, train=train)
             if self.return_past:
                 presents.append(present)
         h = self.norm(h)
@@ -173,6 +181,19 @@ class GPT2Model(ConfigModule):
         if self.return_past:
             ret['past'] = (presents, past_length + inputs.shape[0])
         return ret
+
+def get_config_and_weights(path):
+    path = Path(path)
+    with (path / 'config.json').open() as f:
+        config = DEFAULT_CONFIG._replace(**json.load(f))
+
+    with (path / 'weights.pkl').open('rb') as f:
+        params = pickle.load(f)
+
+    params = jax.tree_map(jnp.array, params)
+    n_param = jax.tree_util.tree_reduce(lambda t, a: t + np.prod(a.shape), params, 0)
+    print(f'Loaded model with {n_param:.2e} parameters')
+    return config, params
 
 def load_model(path='models/117M',
                return_past=False,
@@ -189,22 +210,13 @@ def load_model(path='models/117M',
     """
 
     model_path = Path(path)
-    with (model_path / 'config.json').open() as f:
-        config = DEFAULT_CONFIG._replace(**json.load(f))
+    config, params = get_config_and_weights(model_path)
 
-    def _model_fn(inputs, hidden_perturb=None, past=None):
-        return GPT2Model(config, return_past=return_past, max_len=max_len)(inputs, past, hidden_perturb=hidden_perturb, train=train, use_past=use_past)
+    def _model_fn(inputs, hidden_perturb=None, past=None, prepend_kv=None):
+        return GPT2Model(config, return_past=return_past, max_len=max_len)(inputs, past, hidden_perturb=hidden_perturb, train=train, use_past=use_past, prepend_kv=prepend_kv)
 
     model = hk.transform(_model_fn)
     if not train:
         model = hk.without_apply_rng(model)
-
-    with (model_path / 'weights.pkl').open('rb') as f:
-        params = pickle.load(f)
-
-    params = jax.tree_map(jnp.array, params)
-
-    n_param = jax.tree_util.tree_reduce(lambda t, a: t + np.prod(a.shape), params, 0)
-    print(f'Loaded model with {n_param:.2e} parameters')
 
     return model, params
