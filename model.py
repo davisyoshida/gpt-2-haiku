@@ -16,6 +16,7 @@ Config = namedtuple('Config', [
     'n_head',
     'n_layer',
     'drop_rate',
+    'causal_mask'
 ])
 
 DEFAULT_CONFIG = Config(
@@ -25,6 +26,7 @@ DEFAULT_CONFIG = Config(
     n_head=12,
     n_layer=12,
     drop_rate=0.1,
+    causal_mask=True
 )
 
 zero_init = hk.initializers.Constant(0)
@@ -84,7 +86,6 @@ class GPT2Attention(ConfigModule):
             k, v = (jnp.concatenate((prefix, vecs), axis=1) for prefix, vecs in [(prepend_k, k), (prepend_v, v)])
 
         a = self.multihead_attn(q, k, v, train=train, n_past=past_length)
-        # bug is before here
         a = merge_heads(a)
         a = self.conv2(a)
         if train:
@@ -96,7 +97,9 @@ class GPT2Attention(ConfigModule):
         w = jnp.einsum('hij,hkj->hik', q, k)
         w = w / np.sqrt(v.shape[-1])
 
-        w = mask_attn_weights(w, n_past=n_past)
+        if self.config.causal_mask:
+            w = mask_attn_weights(w, n_past=n_past)
+
         w = jax.nn.softmax(w)
         if train:
             w = hk.dropout(hk.next_rng_key(), self.config.drop_rate, w)
@@ -132,11 +135,12 @@ class GPT2Block(ConfigModule):
         return x, present
 
 class GPT2Model(ConfigModule):
-    def __init__(self, config, name='model', return_past=False, max_len=None):
+    def __init__(self, config, name='model', return_past=False, max_len=None, return_hidden=False):
         super().__init__(config, name)
         self.layers = [GPT2Block(config, name=f'h{i}') for i in range(config.n_layer)]
         self.norm = hk.LayerNorm(-1, create_scale=True, create_offset=True, name='ln_f')
         self.return_past = return_past
+        self.return_hidden = return_hidden
 
         self.max_len = max_len
 
@@ -170,7 +174,10 @@ class GPT2Model(ConfigModule):
             prepend_kv = [None] * self.config.n_layer
 
         presents = []
+        hidden = []
         for layer, layer_past, layer_pert, layer_prepend in zip(self.layers, past, hidden_perturb, prepend_kv):
+            if self.return_hidden:
+                hidden.append(h)
             h, present = layer(h, past=(layer_past, past_length), perturb=layer_pert, prepend_kv=layer_prepend, train=train)
             if self.return_past:
                 presents.append(present)
@@ -180,6 +187,12 @@ class GPT2Model(ConfigModule):
         ret =  {'logits': logits}
         if self.return_past:
             ret['past'] = (presents, past_length + inputs.shape[0])
+
+
+        if self.return_hidden:
+            hidden.append(h)
+            ret['hidden'] = hidden
+
         return ret
 
 def get_config_and_weights(path):
@@ -199,6 +212,7 @@ def load_model(path='models/117M',
                return_past=False,
                train=False,
                use_past=False,
+               return_hidden=False,
                max_len=1024):
     """Load a pretrained GPT-2 model.
     Args:
@@ -213,7 +227,7 @@ def load_model(path='models/117M',
     config, params = get_config_and_weights(model_path)
 
     def _model_fn(inputs, hidden_perturb=None, past=None, prepend_kv=None):
-        return GPT2Model(config, return_past=return_past, max_len=max_len)(inputs, past, hidden_perturb=hidden_perturb, train=train, use_past=use_past, prepend_kv=prepend_kv)
+        return GPT2Model(config, return_past=return_past, max_len=max_len, return_hidden=return_hidden)(inputs, past, hidden_perturb=hidden_perturb, train=train, use_past=use_past, prepend_kv=prepend_kv)
 
     model = hk.transform(_model_fn)
     if not train:
