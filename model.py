@@ -16,7 +16,8 @@ Config = namedtuple('Config', [
     'n_head',
     'n_layer',
     'drop_rate',
-    'causal_mask'
+    'causal_mask',
+    'embedding_multiplier'
 ])
 
 DEFAULT_CONFIG = Config(
@@ -26,7 +27,8 @@ DEFAULT_CONFIG = Config(
     n_head=12,
     n_layer=12,
     drop_rate=0.1,
-    causal_mask=True
+    causal_mask=True,
+    embedding_multiplier=None
 )
 
 zero_init = hk.initializers.Constant(0)
@@ -58,26 +60,53 @@ def mask_attn_weights(w, n_past):
     return w
 
 class GPT2Attention(ConfigModule):
-    def __init__(self, config, name=None):
-        super().__init__(config, name)
-        self.conv1 = hk.Conv1D(config.n_embd * 3, 1, name='c_attn', w_init=hk.initializers.RandomNormal(0.02))
-        self.conv2 = hk.Conv1D(config.n_embd, 1, name='c_proj', w_init=hk.initializers.RandomNormal(0.02))
+    def __call__(self, x, past, attend_to=None, perturb=None, prepend_kv=None, train=False):
 
-    def __call__(self, x, past, perturb=None, prepend_kv=None, train=False):
-        past, past_length = past
+        is_cross_attn = attend_to is not None
+        if not is_cross_attn:
+            past, past_length = past
+            c = hk.Conv1D(
+                self.config.n_embd * 3,
+                1,
+                name='c_attn',
+                w_init=hk.initializers.RandomNormal(0.02)
+            )(x)
 
-        c = self.conv1(x)
-        q, k, v = [split_heads(vecs, self.config.n_head) for vecs in jnp.split(c, 3, axis=1)]
+            q, k, v = [split_heads(vecs, self.config.n_head) for vecs in jnp.split(c, 3, axis=1)]
+            if perturb is not None:
+                k += perturb[0]
+                v +=  perturb[1]
+        else:
+            c_cross = hk.Conv1D(
+                self.config.n_embd * 2,
+                1,
+                name='c_x_attn',
+                w_init=hk.initializers.RandomNormal(0.02)
+            )
+            c_q = hk.Conv1D(
+                self.config.n_embd,
+                1,
+                name='c_q_attn',
+                w_init=hk.initializers.RandomNormal(0.02)
+            )
 
-        if perturb is not None:
-            k += perturb[0]
-            v +=  perturb[1]
+            if past is None:
+                cross_attn_inp = hk.LayerNorm(-1, create_scale=True, create_offset=True, name='pre_cross_attn_norm')(attend_to['h'])
+
+                kv = c_cross(cross_attn_inp)
+                k, v = [split_heads(vecs, self.config.n_head) for vecs in jnp.split(kv, 2, axis=1)]
+
+            q = split_heads(c_q(x), self.config.n_head)
+
 
         if past is not None:
-            pk, pv = map(partial(jnp.squeeze, axis=0), jnp.split(past, 2, axis=0))
+            if not is_cross_attn:
+                pk, pv = map(partial(jnp.squeeze, axis=0), jnp.split(past, 2, axis=0))
 
-            k = jax.lax.dynamic_update_slice_in_dim(pk, k, past_length, axis=1)
-            v = jax.lax.dynamic_update_slice_in_dim(pv, v, past_length, axis=1)
+                k = jax.lax.dynamic_update_slice_in_dim(pk, k, past_length, axis=1)
+                v = jax.lax.dynamic_update_slice_in_dim(pv, v, past_length, axis=1)
+            else:
+                k, v = past
 
         if prepend_kv is not None:
             prepend_k, prepend_v = map(partial(jnp.squeeze, axis=0), jnp.split(prepend_kv, 2, axis=0))
@@ -85,20 +114,46 @@ class GPT2Attention(ConfigModule):
 
             k, v = (jnp.concatenate((prefix, vecs), axis=1) for prefix, vecs in [(prepend_k, k), (prepend_v, v)])
 
-        a = self.multihead_attn(q, k, v, train=train, n_past=past_length)
+
+        if is_cross_attn:
+            past_length = k.shape[1]
+
+        a = self.multihead_attn(
+            q=q,
+            k=k,
+            v=v,
+            train=train,
+            n_past=past_length,
+            valid_mask=None if attend_to is None else attend_to['mask'],
+            causal_mask=self.config.causal_mask and not is_cross_attn
+        )
         a = merge_heads(a)
-        a = self.conv2(a)
+
+        conv2 = hk.Conv1D(self.config.n_embd, 1, name='c_proj', w_init=hk.initializers.RandomNormal(0.02))
+        a = conv2(a)
         if train:
             a = hk.dropout(hk.next_rng_key(), self.config.drop_rate, a)
-        new_cache = jnp.stack([k, v], axis=0)
-        return a, new_cache
 
-    def multihead_attn(self, q, k, v, train=False, n_past=0):
+        if not is_cross_attn:
+            new_past = jnp.stack([k, v], axis=0)
+        elif past is None:
+            new_past = past
+        else:
+            new_past = past
+
+        return a, new_past
+
+    def multihead_attn(self, q, k, v, train=False, n_past=0, valid_mask=None, causal_mask=True):
         w = jnp.einsum('hij,hkj->hik', q, k)
         w = w / np.sqrt(v.shape[-1])
 
-        if self.config.causal_mask:
+        if causal_mask:
             w = mask_attn_weights(w, n_past=n_past)
+
+        if valid_mask is not None:
+            n_pos, = valid_mask.shape
+            valid_mask = valid_mask.reshape(1, 1, n_pos)
+            w -= 1e10 * (1 - valid_mask)
 
         w = jax.nn.softmax(w)
         if train:
@@ -122,15 +177,28 @@ class MLP(ConfigModule):
 class GPT2Block(ConfigModule):
     def __init__(self, config, name=None):
         super().__init__(config, name)
-        self.attn = GPT2Attention(config, name='attn')
         self.mlp = MLP(config, name='mlp')
         self.norm1 = hk.LayerNorm(-1, create_scale=True, create_offset=True, name='ln_1')
         self.norm2 = hk.LayerNorm(-1, create_scale=True, create_offset=True, name='ln_2')
 
-    def __call__(self, x, train=False, **kwargs):
-        a, present = self.attn(self.norm1(x), train=train, **kwargs)
-        x = x + a
-        m = self.mlp(self.norm2(x), train=train)
+
+    def __call__(self, x, train=False, cross_attn_inp=None, past=None, **kwargs):
+        use_cross_attn = cross_attn_inp is not None
+        if past is not None and use_cross_attn:
+            (past, cross_past), past_len = past
+        elif past is not None:
+            past, past_len = past
+
+        x_norm = self.norm1(x)
+        a, present = GPT2Attention(self.config, name='attn')(x_norm, train=train, past=(past, past_len), **kwargs)
+        x = self.norm2(x + a)
+
+        if cross_attn_inp is not None:
+            cross_attn_out, cross_present = GPT2Attention(self.config, name='cross_attn')(x, train=train, past=cross_past, attend_to=cross_attn_inp)
+            x = hk.LayerNorm(-1, create_scale=True, create_offset=True, name='cross_ln')(x + cross_attn_out)
+            present = (present, cross_present)
+
+        m = self.mlp(x, train=train)
         x = x + m
         return x, present
 
@@ -145,7 +213,6 @@ class GPT2Model(ConfigModule):
         self.max_len = max_len
 
     def __call__(self, inputs, past, prepend_kv=None, hidden_perturb=None, train=False, use_past=False):
-        wte =  hk.get_parameter('wte', [self.config.n_vocab, self.config.n_embd], init=hk.initializers.RandomNormal(0.02))
         wpe =  hk.get_parameter('wpe', [self.config.n_ctx, self.config.n_embd], init=hk.initializers.RandomNormal(0.01))
 
         if past is None:
@@ -160,7 +227,17 @@ class GPT2Model(ConfigModule):
             past, past_length = past
             indices = jax.lax.dynamic_slice_in_dim(jnp.arange(self.max_len), past_length, inputs.shape[0])
 
-        w_embed = wte[(inputs,)]
+        embed_layer = hk.Embed(
+            vocab_size=self.config.n_vocab,
+            embed_dim=self.config.n_embd,
+            w_init=hk.initializers.RandomNormal(0.02)
+        )
+
+        w_embed = embed_layer(inputs)
+
+        if self.config.embedding_multiplier is not None:
+            w_embed *= self.config.embedding_multiplier
+
         pos_embed = wpe[indices,]
         h = w_embed + pos_embed
 
@@ -183,7 +260,9 @@ class GPT2Model(ConfigModule):
                 presents.append(present)
         h = self.norm(h)
 
+        wte = embed_layer.get_weights()
         logits = jnp.einsum('te,ve->tv', h, wte)
+
         ret =  {'logits': logits}
         if self.return_past:
             ret['past'] = (presents, past_length + inputs.shape[0])
@@ -213,7 +292,8 @@ def load_model(path='models/117M',
                train=False,
                use_past=False,
                return_hidden=False,
-               max_len=1024):
+               max_len=1024,
+               config_override=None):
     """Load a pretrained GPT-2 model.
     Args:
         path: The directory to load the model from (should include weights.pkl and config.json)
@@ -225,6 +305,7 @@ def load_model(path='models/117M',
 
     model_path = Path(path)
     config, params = get_config_and_weights(model_path)
+    config = config._replace(**(config_override or {}))
 
     def _model_fn(inputs, hidden_perturb=None, past=None, prepend_kv=None):
         return GPT2Model(config, return_past=return_past, max_len=max_len, return_hidden=return_hidden)(inputs, past, hidden_perturb=hidden_perturb, train=train, use_past=use_past, prepend_kv=prepend_kv)
