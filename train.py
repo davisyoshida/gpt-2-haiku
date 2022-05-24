@@ -2,10 +2,11 @@ from collections import deque
 from functools import partial
 from pathlib import Path
 import pickle
+import shutil
 
 import haiku as hk
 import jax
-from jax.experimental import optimizers
+from jax.example_libraries import optimizers
 import jax.numpy as jnp
 import numpy as np
 import pickle
@@ -56,6 +57,10 @@ def train_model(
     if not out_path.exists():
         out_path.mkdir()
     save_file = out_path / f'{out_name}.pkl'
+    shutil.copy(
+        Path(init_path) / 'config.json',
+        Path(out_path) / 'config.json'
+    )
 
     def loss_func(params, inputs, targets, mask, rng):
         if rng is None:

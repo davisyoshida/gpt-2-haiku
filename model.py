@@ -227,13 +227,8 @@ class GPT2Model(ConfigModule):
             past, past_length = past
             indices = jax.lax.dynamic_slice_in_dim(jnp.arange(self.max_len), past_length, inputs.shape[0])
 
-        embed_layer = hk.Embed(
-            vocab_size=self.config.n_vocab,
-            embed_dim=self.config.n_embd,
-            w_init=hk.initializers.RandomNormal(0.02)
-        )
-
-        w_embed = embed_layer(inputs)
+        wte = hk.get_parameter('wte', [self.config.n_vocab, self.config.n_embd], init=hk.initializers.RandomNormal(0.02))
+        w_embed = wte[inputs,]
 
         if self.config.embedding_multiplier is not None:
             w_embed *= self.config.embedding_multiplier
@@ -260,7 +255,6 @@ class GPT2Model(ConfigModule):
                 presents.append(present)
         h = self.norm(h)
 
-        wte = embed_layer.get_weights()
         logits = jnp.einsum('te,ve->tv', h, wte)
 
         ret =  {'logits': logits}
