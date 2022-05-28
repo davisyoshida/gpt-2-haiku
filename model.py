@@ -191,14 +191,18 @@ class GPT2Block(ConfigModule):
 
         x_norm = self.norm1(x)
         a, present = GPT2Attention(self.config, name='attn')(x_norm, train=train, past=(past, past_len), **kwargs)
-        x = self.norm2(x + a)
+        x = x + a
 
         if cross_attn_inp is not None:
-            cross_attn_out, cross_present = GPT2Attention(self.config, name='cross_attn')(x, train=train, past=cross_past, attend_to=cross_attn_inp)
-            x = hk.LayerNorm(-1, create_scale=True, create_offset=True, name='cross_ln')(x + cross_attn_out)
+            pre_x_attn_norm = hk.LayerNorm(-1, create_scale=True, create_offset=True, name='cross_ln')(x + cross_attn_out)
+            cross_attn_out, cross_present = GPT2Attention(self.config, name='cross_attn')(
+                pre_x_attn_norm(x), train=train, past=cross_past, attend_to=cross_attn_inp
+            )
+            x = x + cross_attn_out
+
             present = (present, cross_present)
 
-        m = self.mlp(x, train=train)
+        m = self.mlp(self.norm2(x), train=train)
         x = x + m
         return x, present
 
