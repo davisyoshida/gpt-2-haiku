@@ -194,7 +194,7 @@ class GPT2Block(ConfigModule):
         x = x + a
 
         if cross_attn_inp is not None:
-            pre_x_attn_norm = hk.LayerNorm(-1, create_scale=True, create_offset=True, name='cross_ln')(x + cross_attn_out)
+            pre_x_attn_norm = hk.LayerNorm(-1, create_scale=True, create_offset=True, name='cross_ln')
             cross_attn_out, cross_present = GPT2Attention(self.config, name='cross_attn')(
                 pre_x_attn_norm(x), train=train, past=cross_past, attend_to=cross_attn_inp
             )
